@@ -1,6 +1,7 @@
 // src/core/ram_load.cpp - the shared RAM expert loader: unbuffered reads on a thread pool, then the pin.
 #include "basalt/core/ram_load.hpp"
 #include "basalt/core/vmm.hpp"
+#include "basalt/log.hpp"
 #include "basalt/platform/file.hpp"
 #include "basalt/platform/memory.hpp"
 
@@ -9,12 +10,31 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <thread>
 #include <utility>
 
 namespace basalt::core {
+
+namespace {
+/// The environment's own cap, so a build without `--pin-cap-gib` can still be told.  A plain number of GiB; anything
+/// unreadable or non-positive leaves the cap off.  Read once, at load, because the arena sizes are decided long after
+/// `main()` starts parsing and a value that changed mid-run would split the arena across two rules.
+uint64_t pin_cap_from_env() {
+    const char* e = std::getenv("BASALT_PIN_CAP_GIB");
+    if (e == nullptr) return 0;
+    const double gib = std::atof(e);
+    return gib > 0.0 ? (uint64_t) (gib * 1073741824.0) : 0ull;
+}
+
+uint64_t g_pin_cap = pin_cap_from_env();
+}  // namespace
+
+uint64_t pin_cap_bytes() { return g_pin_cap; }
+
+void set_pin_cap(uint64_t bytes) { g_pin_cap = bytes; }
 
 void add_ram_blob(std::vector<RamRun>& runs, uint8_t* dst, uint64_t file_pos, uint64_t blob_bytes, int64_t expert,
                   uint64_t progress) {
@@ -429,13 +449,21 @@ bool RamAllocation::allocate(uint64_t bytes, bool pin) {
     reset();
     if (!bytes) return true;
     if (bytes > SIZE_MAX - ((2ull << 20) - 1)) return false;
+    const uint64_t cap = pin_cap_bytes();
     if constexpr (platform::kPreferHostVmm) {
-        if (pin) data_ = vmm::alloc_host(bytes, capacity_);
+        // Over the cap the arena is deliberately NOT taken through host VMM: that path maps every byte it is given for
+        // the device, answers no budget, and a mapped GiB costs device memory - which is what an 8 GiB card cannot give
+        // an expert arena of 64 GiB.  Plain memory lets pin_ram() register the cap's worth of prefix instead.
+        if (pin && (cap == 0 || bytes <= cap)) data_ = vmm::alloc_host(bytes, capacity_);
         allocation_pinned_ = data_ != nullptr;
     }
     if (!data_) {
         data_ = alloc_ram(bytes);
         if (data_) capacity_ = ram_padded(bytes);
+        if (pin && cap > 0 && bytes > cap)
+            basalt::log::info("basalt memory", "pin cap: a %.2f GiB arena is over the %.2f GiB cap, so it is plain RAM"
+                                         " and only its first %.2f GiB is registered and mapped with the GPU",
+                         (double) bytes / 1073741824.0, (double) cap / 1073741824.0, (double) cap / 1073741824.0);
     }
     if (!data_) return false;
     bytes_ = bytes;
@@ -460,6 +488,28 @@ RamPin pin_ram(const RamAllocation& allocation, const std::vector<uint64_t>& bou
         p.allocation_backed = true;
         if (device) *device = allocation.data();
         return p;
+    }
+    // The cap's arena: register and map only the prefix.  The bytes past it stay ordinary RAM the CPU tier reads, and
+    // the caller reports the split as a partial pin (`complement_pin_limit_`), which is what decides per expert
+    // whether the device may read it.
+    const uint64_t cap = pin_cap_bytes();
+    if (cap > 0 && cap < allocation.capacity()) {
+        if constexpr (platform::kBoundHostRegistration) {
+            RamPin p = pin_ram_bounded(allocation.data(), allocation.capacity(), allocation.bytes(), bounds, mapped,
+                                       device, cap);
+            if (p.capped) {
+                // The cap says where the user asked to stop; `pin_ram_bounded` already put the OS's own accounting
+                // in `cap_why` (the adapter's non-local budget, what it holds, its reserve).  Say both: which of
+                // the two bound the pin, and by how much.
+                const std::string budget = p.cap_why;
+                p.cap_why = "the " + std::to_string(cap >> 20) + " MiB pin cap" +
+                            (p.cap < cap ? ", bounded below it by the adapters' allowance of " +
+                                          std::to_string(p.cap >> 20) + " MiB" : "");
+                if (!budget.empty()) p.cap_why += " (" + budget + ")";
+            }
+            return p;
+        }
+        return pin_ram(allocation.data(), cap, allocation.bytes(), bounds, mapped, device);
     }
     return pin_ram(allocation.data(), allocation.capacity(), allocation.bytes(), bounds, mapped, device);
 }
