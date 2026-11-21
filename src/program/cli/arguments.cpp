@@ -2,6 +2,7 @@
 #include "help.hpp"
 #include "tokens.hpp"
 
+#include "basalt/core/ram_load.hpp"
 #include "basalt/log.hpp"
 #include "basalt/model/adapter.hpp"
 #include "basalt/model/flags.hpp"
@@ -116,6 +117,13 @@ std::optional<int> parse_options(int argc, char** argv, CommonOptions& o, const 
         }
         else if (a == "--peer-reserve-mib") o.peer_reserve_mib = std::atoi(next("--peer-reserve-mib"));
         else if (a == "--expert-profile") o.expert_profile = next("--expert-profile");
+        else if (a == "--pin-cap-gib") {
+            // The cap on GPU-accessible expert RAM.  0 says "no cap", and it also overrides BASALT_PIN_CAP_GIB, so a
+            // leftover environment value cannot silently keep capping a run the flag says should not be capped.
+            const double gib = std::atof(next("--pin-cap-gib"));
+            if (!(gib >= 0.0)) { basalt::log::error("basalt generate", "--pin-cap-gib needs N >= 0 (0: no cap)"); return 2; }
+            basalt::core::set_pin_cap((uint64_t) (gib * 1073741824.0));
+        }
         else if (a == "--resident-budget-gib") {
             const double gib = std::atof(next("--resident-budget-gib"));
             if (!(gib > 0.0)) { basalt::log::error("basalt generate", "--resident-budget-gib needs N > 0"); return 2; }

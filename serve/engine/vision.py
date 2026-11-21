@@ -95,7 +95,11 @@ class Vision:
 
     def __init__(self, cfg: dict, log=None, env: dict | None = None, start: bool = True):
         """`start` false: down until the service restarts it, as an unloaded encoder is."""
-        args = [cfg["vision_bin"], "--model", cfg["model"]] + (["--gpu"] if cfg.get("gpu") else [])
+        # BASALT-VISION-THREADS (local change, not upstream): CPU encoder threads. The sidecar takes --threads N;
+        # the server never passed it, so the encoder ran on its own default. Unset or non-numeric: sidecar default.
+        threads = str((env or {}).get("BASALT_VISION_THREADS") or os.environ.get("BASALT_VISION_THREADS") or "").strip()
+        args = [cfg["vision_bin"], "--model", cfg["model"]] + (["--gpu"] if cfg.get("gpu") else []) \
+            + (["--threads", threads] if threads.isdigit() else [])
         self.dir = Path(tempfile.mkdtemp(prefix="basalt-vision-"))
         self.spawn = (args, log, env)                   # to start again
         self.stopped = False

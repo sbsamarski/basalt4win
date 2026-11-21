@@ -102,6 +102,14 @@ RamPin pin_ram(void* base, uint64_t register_bytes, uint64_t lock_bytes, const s
                const uint8_t** device = nullptr);
 void unpin_ram(void* base, const RamPin& pin);
 
+/// The most bytes of resident expert RAM the GPU may be given access to; 0 (the default) is no cap, and an arena is
+/// then pinned whole - through host VMM where the platform has it, which answers no budget and takes a device mapping
+/// per GiB.  `--pin-cap-gib` and BASALT_PIN_CAP_GIB set it: an arena over the cap is ordinary memory, `pin_ram()`
+/// registers and maps only its first `cap` bytes, and the rest stays page-locked RAM that the CPU tier computes - the
+/// split the caller already reports as a partial pin, and the part that costs no device memory.
+uint64_t pin_cap_bytes();
+void set_pin_cap(uint64_t bytes);   ///< CLI-only: set once at startup, before any arena is allocated
+
 /// Owns an expert RAM span. Pinning may come from host VMM, otherwise pin_ram registers it after the read.
 /// Ordinary registrations must be removed before reset; allocation-backed pins live until reset.
 class RamAllocation {
